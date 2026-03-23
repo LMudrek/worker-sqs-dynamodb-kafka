@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using Amazon;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.Model;
 using Amazon.SQS;
@@ -15,8 +17,38 @@ var builder = Host.CreateApplicationBuilder(args);
 
 builder.Services.Configure<AppOptions>(builder.Configuration.GetSection(AppOptions.SectionName));
 
-builder.Services.AddSingleton<IAmazonSQS>(_ => new AmazonSQSClient());
-builder.Services.AddSingleton<IAmazonDynamoDB>(_ => new AmazonDynamoDBClient());
+builder.Services.AddSingleton<IAmazonSQS>(_ =>
+{
+    var region = builder.Configuration["AWS_REGION"] ?? "us-east-1";
+    var endpoint = builder.Configuration["AWS_ENDPOINT_URL"];
+
+    var config = new AmazonSQSConfig
+    {
+        RegionEndpoint = RegionEndpoint.GetBySystemName(region)
+    };
+
+    if (!string.IsNullOrWhiteSpace(endpoint))
+        config.ServiceURL = endpoint;
+
+    return new AmazonSQSClient(config);
+});
+
+builder.Services.AddSingleton<IAmazonDynamoDB>(_ =>
+{
+    var region = builder.Configuration["AWS_REGION"] ?? "us-east-1";
+    var endpoint = builder.Configuration["AWS_ENDPOINT_URL"];
+
+    var config = new AmazonDynamoDBConfig
+    {
+        RegionEndpoint = RegionEndpoint.GetBySystemName(region)
+    };
+
+    if (!string.IsNullOrWhiteSpace(endpoint))
+        config.ServiceURL = endpoint;
+
+    return new AmazonDynamoDBClient(config);
+});
+
 builder.Services.AddSingleton<IKafkaProducer, KafkaProducer>();
 builder.Services.AddSingleton<IDynamoConversationRepository, DynamoConversationRepository>();
 builder.Services.AddSingleton<ISqsMessageHandler, SqsMessageHandler>();
@@ -41,22 +73,15 @@ public sealed class AppOptions
 }
 
 public sealed record SqsEnvelope(
-    string PartitionKey,
-    string Id,
-    long Timestamp);
+    [property: JsonPropertyName("partitionKey")] string PartitionKey,
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("timestamp")] long Timestamp);
 
-public sealed record ConversationMessage(
-    string Content,
-    string Role,
-    long Timestamp);
+public sealed record ConversationMessage(string Content, string Role, long Timestamp);
 
-public sealed record KafkaConversationPayload(
-    string Id,
-    IReadOnlyList<KafkaConversationMessage> Messages);
+public sealed record KafkaConversationPayload(string Id, IReadOnlyList<KafkaConversationMessage> Messages);
 
-public sealed record  KafkaConversationMessage(
-    string Content,
-    string Role);
+public sealed record KafkaConversationMessage(string Content, string Role);
 
 public interface ISqsMessageHandler
 {
@@ -68,7 +93,8 @@ public interface IDynamoConversationRepository
     Task<IReadOnlyList<ConversationMessage>> GetMessagesAsync(
         string partitionKey,
         string id,
-        long referenceTimestamp,
+        long fromTimestamp,
+        long toTimestamp,
         CancellationToken cancellationToken);
 }
 
@@ -79,8 +105,6 @@ public interface IKafkaProducer
 
 public sealed class SqsWorker : BackgroundService
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-
     private readonly IAmazonSQS _sqs;
     private readonly ILogger<SqsWorker> _logger;
     private readonly AppOptions _options;
@@ -117,17 +141,10 @@ public sealed class SqsWorker : BackgroundService
                 }, stoppingToken);
 
                 if (response.Messages.Count == 0)
-                {
                     continue;
-                }
 
                 foreach (var sqsMessage in response.Messages)
                 {
-                    if (stoppingToken.IsCancellationRequested)
-                    {
-                        break;
-                    }
-
                     try
                     {
                         await _handler.HandleAsync(sqsMessage.Body, stoppingToken);
@@ -179,17 +196,14 @@ public sealed class SqsMessageHandler : ISqsMessageHandler
     private readonly IDynamoConversationRepository _repository;
     private readonly IKafkaProducer _producer;
     private readonly AppOptions _options;
-    private readonly ILogger<SqsMessageHandler> _logger;
 
     public SqsMessageHandler(
         IDynamoConversationRepository repository,
         IKafkaProducer producer,
-        IOptions<AppOptions> options,
-        ILogger<SqsMessageHandler> logger)
+        IOptions<AppOptions> options)
     {
         _repository = repository;
         _producer = producer;
-        _logger = logger;
         _options = options.Value;
     }
 
@@ -198,43 +212,6 @@ public sealed class SqsMessageHandler : ISqsMessageHandler
         var envelope = JsonSerializer.Deserialize<SqsEnvelope>(sqsBody, JsonOptions)
                        ?? throw new InvalidOperationException("Invalid SQS body.");
 
-        ValidateEnvelope(envelope);
-
-        var fromTimestamp = envelope.Timestamp - (long)_options.DynamoLookbackWindow.TotalMilliseconds;
-        if (fromTimestamp < 0)
-        {
-            fromTimestamp = 0;
-        }
-
-        var items = await _repository.GetMessagesAsync(
-            envelope.PartitionKey,
-            envelope.Id,
-            envelope.Timestamp,
-            cancellationToken);
-            
-
-        _logger.LogInformation(items.ToString());
-
-        var payload = new KafkaConversationPayload(
-            envelope.Id,
-            items
-                .OrderBy(x => x.Timestamp)
-                .Select(x => new KafkaConversationMessage(x.Content, x.Role))
-                .ToList());
-
-        _logger.LogInformation(payload.ToString());
-
-        await _producer.PublishAsync(payload, cancellationToken);
-
-        _logger.LogInformation(
-            "Processed SQS message. PartitionKey={PartitionKey}, Id={Id}, Messages={Count}",
-            envelope.PartitionKey,
-            envelope.Id,
-            payload.Messages.Count);
-    }
-
-    private static void ValidateEnvelope(SqsEnvelope envelope)
-    {
         if (string.IsNullOrWhiteSpace(envelope.PartitionKey))
             throw new InvalidOperationException("partitionKey is required.");
 
@@ -243,6 +220,26 @@ public sealed class SqsMessageHandler : ISqsMessageHandler
 
         if (envelope.Timestamp <= 0)
             throw new InvalidOperationException("timestamp must be greater than zero.");
+
+        var fromTimestamp = envelope.Timestamp - (long)_options.DynamoLookbackWindow.TotalMilliseconds;
+        if (fromTimestamp < 0)
+            fromTimestamp = 0;
+
+        var messages = await _repository.GetMessagesAsync(
+            envelope.PartitionKey,
+            envelope.Id,
+            fromTimestamp,
+            envelope.Timestamp,
+            cancellationToken);
+
+        var payload = new KafkaConversationPayload(
+            envelope.Id,
+            messages
+                .OrderBy(m => m.Timestamp)
+                .Select(m => new KafkaConversationMessage(m.Content, m.Role))
+                .ToList());
+
+        await _producer.PublishAsync(payload, cancellationToken);
     }
 }
 
@@ -268,46 +265,35 @@ public sealed class DynamoConversationRepository : IDynamoConversationRepository
     public async Task<IReadOnlyList<ConversationMessage>> GetMessagesAsync(
         string partitionKey,
         string id,
-        long referenceTimestamp,
+        long fromTimestamp,
+        long toTimestamp,
         CancellationToken cancellationToken)
     {
-        var fromTimestamp = referenceTimestamp - (long)_options.DynamoLookbackWindow.TotalMilliseconds;
-        if (fromTimestamp < 0)
-        {
-            fromTimestamp = 0;
-        }
-
-        var fromSortKey = BuildSortKey(fromTimestamp);
-        var toSortKey = BuildSortKey(referenceTimestamp);
-
         var result = new List<ConversationMessage>();
         Dictionary<string, AttributeValue>? lastEvaluatedKey = null;
 
         do
         {
-            var request = new QueryRequest
+            var response = await _dynamoDb.QueryAsync(new QueryRequest
             {
                 TableName = _options.DynamoTableName,
                 KeyConditionExpression = $"{PartitionKeyAttribute} = :pk AND {SortKeyAttribute} BETWEEN :from AND :to",
                 FilterExpression = $"{IdAttribute} = :id",
+                ProjectionExpression = $"{ContentAttribute}, {RoleAttribute}, {TimestampAttribute}",
                 ExpressionAttributeValues = new Dictionary<string, AttributeValue>
                 {
                     [":pk"] = new AttributeValue { S = partitionKey },
-                    [":from"] = new AttributeValue { S = fromSortKey },
-                    [":to"] = new AttributeValue { S = toSortKey },
+                    [":from"] = new AttributeValue { S = BuildSortKey(fromTimestamp) },
+                    [":to"] = new AttributeValue { S = BuildSortKey(toTimestamp) },
                     [":id"] = new AttributeValue { S = id }
                 },
                 ExclusiveStartKey = lastEvaluatedKey,
                 ConsistentRead = false,
                 ScanIndexForward = true
-            };
-
-            var response = await _dynamoDb.QueryAsync(request, cancellationToken);
+            }, cancellationToken);
 
             foreach (var item in response.Items)
-            {
                 result.Add(Map(item));
-            }
 
             lastEvaluatedKey = response.LastEvaluatedKey;
         }
@@ -338,19 +324,23 @@ public sealed class DynamoConversationRepository : IDynamoConversationRepository
         if (!item.TryGetValue(attributeName, out var value))
             throw new InvalidOperationException($"Missing DynamoDB attribute: {attributeName}");
 
-        if (!string.IsNullOrWhiteSpace(value.N) && long.TryParse(value.N, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+        if (!string.IsNullOrWhiteSpace(value.N) &&
+            long.TryParse(value.N, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+        {
             return parsed;
+        }
 
-        if (!string.IsNullOrWhiteSpace(value.S) && long.TryParse(value.S, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed))
+        if (!string.IsNullOrWhiteSpace(value.S) &&
+            long.TryParse(value.S, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed))
+        {
             return parsed;
+        }
 
         throw new InvalidOperationException($"Invalid numeric DynamoDB attribute: {attributeName}");
     }
 
     private static string BuildSortKey(long timestamp)
-    {
-        return $"{SortKeyPrefix}{timestamp.ToString("D20", CultureInfo.InvariantCulture)}";
-    }
+        => $"{SortKeyPrefix}{timestamp}";
 }
 
 public sealed class KafkaProducer : IKafkaProducer, IDisposable
@@ -375,14 +365,31 @@ public sealed class KafkaProducer : IKafkaProducer, IDisposable
             CompressionType = CompressionType.Snappy
         };
 
-        //_producer = new ProducerBuilder<string, byte[]>(config).Build();
+        _producer = new ProducerBuilder<string, byte[]>(config).Build();
     }
 
     public async Task PublishAsync(KafkaConversationPayload payload, CancellationToken cancellationToken)
     {
-        var key = payload.Id;
         var value = JsonSerializer.SerializeToUtf8Bytes(payload, JsonOptions);
 
+        var deliveryResult = await _producer.ProduceAsync(
+            _options.KafkaTopic,
+            new Message<string, byte[]>
+            {
+                Key = payload.Id,
+                Value = value,
+                Headers = new Headers
+                {
+                    new Header("content-type", Encoding.UTF8.GetBytes("application/json"))
+                }
+            },
+            cancellationToken);
+
+        if (deliveryResult.Status != PersistenceStatus.Persisted)
+        {
+            throw new InvalidOperationException(
+                $"Kafka message was not persisted. Topic={deliveryResult.Topic}, Partition={deliveryResult.Partition}, Offset={deliveryResult.Offset}");
+        }
     }
 
     public void Dispose()
