@@ -81,6 +81,8 @@ export App__DynamoTableName=${TABLE_NAME}
 export App__KafkaBootstrapServers=localhost:9092
 export App__KafkaTopic="ainda-nao"
 
-cd SqsWorkerKafka
-dotnet restore
-dotnet run
+#cd ../app/SqsWorkerKafka
+
+#dotnet restore
+
+#dotnet run

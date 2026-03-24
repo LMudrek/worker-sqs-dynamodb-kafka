@@ -54,7 +54,7 @@ public sealed record KafkaConversationPayload(
     string Id,
     IReadOnlyList<KafkaConversationMessage> Messages);
 
-public sealed record  KafkaConversationMessage(
+public sealed record KafkaConversationMessage(
     string Content,
     string Role);
 
@@ -211,7 +211,7 @@ public sealed class SqsMessageHandler : ISqsMessageHandler
             envelope.Id,
             envelope.Timestamp,
             cancellationToken);
-            
+
 
         _logger.LogInformation(items.ToString());
 
@@ -259,10 +259,13 @@ public sealed class DynamoConversationRepository : IDynamoConversationRepository
     private readonly IAmazonDynamoDB _dynamoDb;
     private readonly AppOptions _options;
 
-    public DynamoConversationRepository(IAmazonDynamoDB dynamoDb, IOptions<AppOptions> options)
+    private readonly ILogger<DynamoConversationRepository> _logger;
+
+    public DynamoConversationRepository(IAmazonDynamoDB dynamoDb, IOptions<AppOptions> options, ILogger<DynamoConversationRepository> logger)
     {
         _dynamoDb = dynamoDb;
         _options = options.Value;
+        _logger = logger;
     }
 
     public async Task<IReadOnlyList<ConversationMessage>> GetMessagesAsync(
@@ -279,6 +282,8 @@ public sealed class DynamoConversationRepository : IDynamoConversationRepository
 
         var fromSortKey = BuildSortKey(fromTimestamp);
         var toSortKey = BuildSortKey(referenceTimestamp);
+
+        _logger.LogInformation("fromSortKey={fromSortKey}, toSortKey={toSortKey}", fromSortKey, toSortKey);
 
         var result = new List<ConversationMessage>();
         Dictionary<string, AttributeValue>? lastEvaluatedKey = null;
@@ -301,6 +306,7 @@ public sealed class DynamoConversationRepository : IDynamoConversationRepository
                 ConsistentRead = false,
                 ScanIndexForward = true
             };
+
 
             var response = await _dynamoDb.QueryAsync(request, cancellationToken);
 
@@ -349,7 +355,7 @@ public sealed class DynamoConversationRepository : IDynamoConversationRepository
 
     private static string BuildSortKey(long timestamp)
     {
-        return $"{SortKeyPrefix}{timestamp.ToString("D20", CultureInfo.InvariantCulture)}";
+        return $"{SortKeyPrefix}{timestamp.ToString("D13", CultureInfo.InvariantCulture)}";
     }
 }
 
@@ -360,8 +366,11 @@ public sealed class KafkaProducer : IKafkaProducer, IDisposable
     private readonly IProducer<string, byte[]> _producer;
     private readonly AppOptions _options;
 
-    public KafkaProducer(IOptions<AppOptions> options)
+    private readonly ILogger<KafkaProducer> _logger;
+
+    public KafkaProducer(IOptions<AppOptions> options, ILogger<KafkaProducer> logger)
     {
+        _logger = logger;
         _options = options.Value;
 
         var config = new ProducerConfig
@@ -383,6 +392,12 @@ public sealed class KafkaProducer : IKafkaProducer, IDisposable
         var key = payload.Id;
         var value = JsonSerializer.SerializeToUtf8Bytes(payload, JsonOptions);
 
+        
+
+        var options = new JsonSerializerOptions { WriteIndented = true };
+        string indentedJsonString = JsonSerializer.Serialize(payload, options);
+
+        _logger.LogInformation("payload={value}", indentedJsonString);
     }
 
     public void Dispose()
