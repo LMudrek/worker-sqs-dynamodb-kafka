@@ -79,7 +79,7 @@ export AWS_ENDPOINT_URL=${LOCALSTACK_ENDPOINT}
 export App__SqsQueueUrl=${QUEUE_URL}
 export App__DynamoTableName=${TABLE_NAME}
 export App__KafkaBootstrapServers=localhost:9092
-export App__KafkaTopic="ainda-nao"
+export App__KafkaTopic=${KAFKA_TOPIC}
 
 #cd ../app/SqsWorkerKafka
 
