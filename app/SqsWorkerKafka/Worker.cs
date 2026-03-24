@@ -274,14 +274,8 @@ public sealed class DynamoConversationRepository : IDynamoConversationRepository
         long toTimestamp,
         CancellationToken cancellationToken)
     {
-        var fromTimestamp = referenceTimestamp - (long)_options.DynamoLookbackWindow.TotalMilliseconds;
-        if (fromTimestamp < 0)
-        {
-            fromTimestamp = 0;
-        }
-
         var fromSortKey = BuildSortKey(fromTimestamp);
-        var toSortKey = BuildSortKey(referenceTimestamp);
+        var toSortKey = BuildSortKey(toTimestamp);
 
         _logger.LogInformation("fromSortKey={fromSortKey}, toSortKey={toSortKey}", fromSortKey, toSortKey);
 
@@ -295,7 +289,12 @@ public sealed class DynamoConversationRepository : IDynamoConversationRepository
                 TableName = _options.DynamoTableName,
                 KeyConditionExpression = $"{PartitionKeyAttribute} = :pk AND {SortKeyAttribute} BETWEEN :from AND :to",
                 FilterExpression = $"{IdAttribute} = :id",
-                ProjectionExpression = $"{ContentAttribute}, {RoleAttribute}, {TimestampAttribute}",
+                ProjectionExpression = $"{ContentAttribute}, #{RoleAttribute}, #{TimestampAttribute}",
+                ExpressionAttributeNames = new Dictionary<string, string>
+                {
+                    [$"#{RoleAttribute}"] = RoleAttribute,
+                    [$"#{TimestampAttribute}"] = TimestampAttribute
+                },
                 ExpressionAttributeValues = new Dictionary<string, AttributeValue>
                 {
                     [":pk"] = new AttributeValue { S = partitionKey },
