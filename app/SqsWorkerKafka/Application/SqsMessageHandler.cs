@@ -33,6 +33,9 @@ public sealed class SqsMessageHandler : ISqsMessageHandler
 
     public async Task HandleAsync(string sqsBody, CancellationToken cancellationToken)
     {
+        if (string.IsNullOrWhiteSpace(sqsBody))
+            throw new InvalidOperationException("SQS body is required.");
+
         SqsEnvelope envelope;
 
         try
@@ -71,6 +74,12 @@ public sealed class SqsMessageHandler : ISqsMessageHandler
         var payload = new KafkaConversationPayload(
             envelope.Id,
             messages.Select(m => new KafkaConversationMessage(m.Content, m.Role)).ToArray());
+
+        if (payload.Messages.Count == 0)
+        {
+            _logger.LogWarning("Skipping Kafka publish for conversation {ConversationId} because no messages were found", envelope.Id);
+            return;
+        }
 
         _logger.LogInformation(
             "Publishing conversation {ConversationId} with {MessageCount} messages",

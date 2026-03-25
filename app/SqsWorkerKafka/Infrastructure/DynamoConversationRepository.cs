@@ -40,6 +40,21 @@ public sealed class DynamoConversationRepository : IDynamoConversationRepository
         long toTimestamp,
         CancellationToken cancellationToken)
     {
+        if (string.IsNullOrWhiteSpace(partitionKey))
+            throw new ArgumentException("partitionKey is required.", nameof(partitionKey));
+
+        if (string.IsNullOrWhiteSpace(id))
+            throw new ArgumentException("id is required.", nameof(id));
+
+        if (fromTimestamp < 0)
+            throw new ArgumentOutOfRangeException(nameof(fromTimestamp));
+
+        if (toTimestamp < 0)
+            throw new ArgumentOutOfRangeException(nameof(toTimestamp));
+
+        if (fromTimestamp > toTimestamp)
+            throw new ArgumentException("fromTimestamp must be less than or equal to toTimestamp.");
+
         var fromSortKey = BuildSortKey(fromTimestamp);
         var toSortKey = BuildSortKey(toTimestamp);
 

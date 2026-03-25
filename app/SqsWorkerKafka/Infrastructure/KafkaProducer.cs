@@ -39,8 +39,26 @@ public sealed class KafkaProducer : IKafkaProducer, IDisposable
         _producer = new ProducerBuilder<string, byte[]>(config).Build();
     }
 
+    internal KafkaProducer(
+        IProducer<string, byte[]> producer,
+        IOptions<AppOptions> options,
+        ILogger<KafkaProducer> logger)
+    {
+        _producer = producer;
+        _options = options.Value;
+        _logger = logger;
+    }
+
     public async Task PublishAsync(KafkaConversationPayload payload, CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(payload);
+
+        if (string.IsNullOrWhiteSpace(payload.Id))
+            throw new InvalidOperationException("payload.Id is required.");
+
+        if (payload.Messages is null)
+            throw new InvalidOperationException("payload.Messages is required.");
+
         var value = JsonSerializer.SerializeToUtf8Bytes(payload, JsonOptions);
 
         var delivery = await _producer.ProduceAsync(
