@@ -1,0 +1,182 @@
+{
+  "monitors": [
+    {
+      "name": "[SEV-1] Lambda Stream Backlog - IteratorAge alto",
+      "type": "query alert",
+      "query": "avg(last_5m):max:aws.lambda.iterator_age{functionname:fn-stream-consumer,env:prod} > 60",
+      "message": "Backlog no DynamoDB Stream. IteratorAge acima do limite.\n\nPossível causa: consumo inferior à taxa de ingestão.\n\n@oncall-team",
+      "tags": [
+        "env:prod",
+        "service:stream-consumer",
+        "team:data",
+        "severity:critical"
+      ],
+      "options": {
+        "thresholds": {
+          "critical": 60,
+          "warning": 30
+        },
+        "notify_no_data": true,
+        "no_data_timeframe": 10,
+        "renotify_interval": 30,
+        "evaluation_delay": 60,
+        "include_tags": true
+      },
+      "priority": 1
+    },
+    {
+      "name": "[SEV-2] Lambda Error Rate elevado",
+      "type": "query alert",
+      "query": "sum(last_5m):aws.lambda.errors{functionname:fn-stream-consumer,env:prod} / sum:aws.lambda.invocations{functionname:fn-stream-consumer,env:prod} > 0.05",
+      "message": "Taxa de erro da Lambda acima do esperado.\n\nImpacto direto no processamento de eventos.\n\n@oncall-team",
+      "tags": [
+        "env:prod",
+        "service:stream-consumer",
+        "team:data",
+        "severity:high"
+      ],
+      "options": {
+        "thresholds": {
+          "critical": 0.05,
+          "warning": 0.01
+        },
+        "notify_no_data": true,
+        "no_data_timeframe": 10,
+        "renotify_interval": 30,
+        "evaluation_delay": 60,
+        "include_tags": true
+      },
+      "priority": 2
+    },
+    {
+      "name": "[SEV-1] Lambda Throttling detectado",
+      "type": "query alert",
+      "query": "sum(last_5m):aws.lambda.throttles{functionname:fn-stream-consumer,env:prod} > 0",
+      "message": "Throttling na Lambda.\n\nIndica limite de concorrência atingido.\n\n@oncall-team",
+      "tags": [
+        "env:prod",
+        "service:stream-consumer",
+        "team:data",
+        "severity:critical"
+      ],
+      "options": {
+        "thresholds": {
+          "critical": 1
+        },
+        "notify_no_data": false,
+        "renotify_interval": 30,
+        "evaluation_delay": 60,
+        "include_tags": true
+      },
+      "priority": 1
+    },
+    {
+      "name": "[SEV-2] Lambda concorrência alta",
+      "type": "query alert",
+      "query": "max(last_5m):aws.lambda.concurrent_executions{functionname:fn-stream-consumer,env:prod} / 100 > 0.95",
+      "message": "Lambda próxima do limite de concorrência.\n\nRisco de throttling iminente.\n\n@oncall-team",
+      "tags": [
+        "env:prod",
+        "service:stream-consumer",
+        "team:data",
+        "severity:high"
+      ],
+      "options": {
+        "thresholds": {
+          "critical": 0.95,
+          "warning": 0.8
+        },
+        "notify_no_data": false,
+        "renotify_interval": 30,
+        "evaluation_delay": 60,
+        "include_tags": true
+      },
+      "priority": 2
+    },
+    {
+      "name": "[SEV-2] Lambda Duration anômalo",
+      "type": "query alert",
+      "query": "avg(last_5m):aws.lambda.duration{functionname:fn-stream-consumer,env:prod} > 2000",
+      "message": "Tempo de execução da Lambda elevado.\n\nPode causar aumento de backlog.\n\n@oncall-team",
+      "tags": [
+        "env:prod",
+        "service:stream-consumer",
+        "team:data",
+        "severity:high"
+      ],
+      "options": {
+        "thresholds": {
+          "critical": 2000,
+          "warning": 1000
+        },
+        "notify_no_data": false,
+        "renotify_interval": 30,
+        "evaluation_delay": 60,
+        "include_tags": true
+      },
+      "priority": 2
+    },
+    {
+      "name": "[SEV-1] DLQ com mensagens",
+      "type": "query alert",
+      "query": "max(last_5m):aws.sqs.approximate_number_of_messages_visible{queue:dlq-stream-consumer,env:prod} > 0",
+      "message": "Mensagens acumulando na DLQ.\n\nEventos estão falhando definitivamente.\n\n@oncall-team",
+      "tags": [
+        "env:prod",
+        "service:stream-consumer",
+        "team:data",
+        "severity:critical"
+      ],
+      "options": {
+        "thresholds": {
+          "critical": 1
+        },
+        "notify_no_data": false,
+        "renotify_interval": 30,
+        "evaluation_delay": 60,
+        "include_tags": true
+      },
+      "priority": 1
+    },
+    {
+      "name": "[SEV-1] Falha de processamento de negócio",
+      "type": "query alert",
+      "query": "sum(last_5m):custom.business_processing_failures{service:stream-consumer,env:prod} > 0",
+      "message": "Falha lógica no processamento de eventos.\n\nErro não capturado por métricas AWS.\n\n@oncall-team",
+      "tags": [
+        "env:prod",
+        "service:stream-consumer",
+        "team:data",
+        "severity:critical"
+      ],
+      "options": {
+        "thresholds": {
+          "critical": 1
+        },
+        "notify_no_data": false,
+        "renotify_interval": 30,
+        "evaluation_delay": 60,
+        "include_tags": true
+      },
+      "priority": 1
+    },
+    {
+      "name": "[SEV-1] Falha crítica no processamento de stream",
+      "type": "composite",
+      "query": "<ITERATOR_AGE_MONITOR_ID> && <ERROR_RATE_MONITOR_ID>",
+      "message": "Erro + backlog detectados simultaneamente.\n\nSistema degradado.\n\n@oncall-team",
+      "tags": [
+        "env:prod",
+        "service:stream-consumer",
+        "team:data",
+        "severity:critical"
+      ],
+      "options": {
+        "notify_no_data": false,
+        "renotify_interval": 30,
+        "include_tags": true
+      },
+      "priority": 1
+    }
+  ]
+}
