@@ -1,7 +1,7 @@
 RFC — Ingestão assíncrona de Parquet via API Gateway, Lambda e S3 com processamento em janelas no Glue (Write-and-Audit)
 
 Status: Proposta
-Versão: 5.1
+Versão: 5.2
 Intenção: Definir uma solução resiliente, stateless e escalável para ingestão de arquivos Parquet gerados por uma aplicação em ECS em outra conta AWS, com processamento assíncrono em janelas no Glue, disponibilização dos dados na camada SOR e execução de Data Quality sem bloqueio da disponibilidade do dado.
 
 ⸻
@@ -24,6 +24,18 @@ O upload é secundário em relação ao fluxo principal da aplicação produtora
 
 Quando o conteúdo produzido ultrapassar o limite de transporte suportado pela camada de exposição da API, o produtor deve fragmentar o conjunto em múltiplos arquivos Parquet completos antes do envio. Não há envio de fragmentos binários de um único Parquet. O que entra na plataforma são arquivos autocontidos, válidos e independentes.
 
+Restrições de transporte da solução
+
+A arquitetura é limitada pelas capacidades da camada de exposição da AWS:
+
+* o Amazon API Gateway suporta payloads de até 10 MB por requisição HTTP;
+* a invocação síncrona da AWS Lambda suporta payloads de até 6 MB;
+* durante a integração entre API Gateway e Lambda, o conteúdo binário é entregue codificado em Base64, aumentando o tamanho efetivo do payload transmitido.
+
+Como consequência, o tamanho máximo do arquivo Parquet produzido pela aplicação deve ser significativamente inferior ao limite nominal da Lambda. O produtor deve considerar esse overhead de codificação ao definir a estratégia de fragmentação, gerando arquivos suficientemente pequenos para garantir que, após a serialização do multipart/form-data e da codificação Base64 realizada pela integração, o payload permaneça dentro dos limites suportados.
+
+Por esse motivo, a plataforma adota como diretriz operacional que os arquivos gerados pelo produtor possuam tamanho inferior ao limite máximo da Lambda, preservando margem de segurança para o overhead de transporte.
+
 ⸻
 
 2. Objetivo
@@ -38,166 +50,6 @@ Definir uma arquitetura em que:
 * o Glue consolide small files, materialize a camada SOR, atualize o catálogo e execute Data Quality;
 * o Data Quality atue como observabilidade ativa e governança, sem indisponibilizar o dado;
 * a arquitetura seja fácil de operar, evoluir e reprocessar.
-
-⸻
-
-3. Não objetivos
-
-Esta RFC não propõe:
-
-* sessão de upload;
-* controle de partes de um Parquet na API;
-* montagem de arquivo na Lambda;
-* manifesto de finalização;
-* workflow síncrono entre ingestão e processamento;
-* DynamoDB para estado de upload;
-* presigned URLs;
-* quarentena automática do dado em caso de falha de qualidade;
-* bloqueio da camada SOR até a aprovação do Data Quality.
-
-⸻
-
-4. Decisão
-
-A arquitetura adotada é baseada em três camadas funcionais:
-
-1. Ingestão: API Gateway + Lambda recebendo arquivos Parquet válidos.
-2. Persistência: S3 como Landing Zone imutável.
-3. Processamento: Glue em janela, com consolidação, catalogação e Data Quality não bloqueante.
-
-O contrato de ingestão é propositalmente simples: cada requisição representa um arquivo Parquet completo. A API nunca recebe bucket, key física ou path final. Esses elementos são resolvidos internamente pela plataforma.
-
-A Lambda tem responsabilidade exclusiva de validação estrutural, padronização da key e persistência do objeto no S3. Ela não mantém estado entre requisições.
-
-O Glue roda de forma assíncrona e periódica, consumindo os arquivos já publicados, consolidando small files, materializando a camada SOR e executando as regras de Data Quality. Em caso de falha das regras, a plataforma gera alerta e incidente, mas não remove a disponibilidade do dado para consumo.
-
-Este modelo é conhecido como Write-and-Audit: escreve primeiro, audita depois. A camada SOR é a fonte oficial de consumo, e o Data Quality atua como mecanismo de observabilidade e governança ativa, não como barreira de publicação.
-
-⸻
-
-5. Arquitetura proposta
-
-Account origem (Produtor)                              Account destino (Plataforma de Dados)
-  |                                                     |
-ECS Task                                                |
-  |                                                     |
-  |  gera DataFrame e serializa em Parquet              |
-  |                                                     |
-  +--> envia arquivo Parquet completo                   |
-        via HTTPS multipart/form-data                   |
-        com fire-and-forget lógico                      |
-  |                                                     |
-  v                                                     |
-API Gateway                                             |
-  |                                                     |
-  v                                                     |
-Lambda stateless                                        |
-  |                                                     |
-  v                                                     |
-S3 Landing Zone (arquivos imutáveis)                    |
-  |                                                     |
-  |  execução em janela / watermark                     |
-  v                                                     |
-Glue Job / Workflow agendado                            |
-  |                                                     |
-  +--> consolidação de small files                      |
-  +--> materialização da camada SOR                    |
-  +--> atualização do Glue Catalog                     |
-  +--> Glue Data Quality não-bloqueante                |
-  |                                                     |
-  v                                                     |
-Consumo analítico e governança operacional              |
-
-Visão de fluxo
-
-* o produtor gera um ou mais arquivos Parquet completos;
-* cada arquivo é enviado individualmente;
-* a API responde rapidamente com sucesso quando a persistência física foi concluída;
-* o Glue processa os arquivos em janela, sem depender de sinal de finalização;
-* os dados são disponibilizados na camada SOR;
-* o Data Quality avalia o conteúdo e gera incidentes quando necessário.
-
-⸻
-
-6. Responsabilidades por componente
-
-6.1 ECS produtor
-
-Responsável por:
-
-* serializar o DataFrame em Parquet;
-* particionar logicamente o conjunto em múltiplos arquivos quando necessário;
-* enviar cada arquivo individualmente;
-* tratar retry de forma simples;
-* não acoplar a vida da mensagem principal ao sucesso do upload do arquivo secundário, quando aplicável.
-
-A aplicação produtora não conhece path físico, bucket, estrutura de S3 ou regras de catalogação.
-
-6.2 API Gateway
-
-Responsável por:
-
-* autenticação e autorização;
-* limitação de taxa;
-* roteamento;
-* aplicação dos limites de payload da camada de exposição;
-* aceitar tráfego binário quando configurado para isso.
-
-A API não executa regra de negócio nem processamento analítico.
-
-6.3 Lambda
-
-Responsável por:
-
-* validar metadados obrigatórios;
-* validar integridade estrutural da requisição;
-* validar que o arquivo enviado é um Parquet válido;
-* construir a key S3 conforme padrão da plataforma;
-* persistir o objeto na Landing Zone;
-* responder com sucesso assim que a gravação física for concluída.
-
-A Lambda permanece stateless. Ela não guarda sessão, não mantém catálogo de upload, não reconstrói arquivos e não coordena finalização.
-
-6.4 S3 Landing Zone
-
-Responsável por:
-
-* receber os arquivos na forma imutável;
-* servir como ponto de entrada bruta;
-* permitir reprocessamentos;
-* preservar histórico operacional de ingestão.
-
-A Landing Zone não é a camada final de consumo.
-
-6.5 Glue agendado
-
-Responsável por:
-
-* ler os arquivos disponíveis na Landing Zone conforme janela de execução;
-* ignorar arquivos muito recentes quando necessário, utilizando watermark operacional;
-* consolidar small files;
-* escrever a camada SOR;
-* atualizar o Glue Catalog;
-* executar Data Quality;
-* publicar resultados e incidentes quando houver anomalia.
-
-6.6 Camada SOR
-
-Responsável por:
-
-* ser o primeiro ponto oficial de disponibilização do dado para consumo;
-* conter dados materializados e otimizados;
-* ser idempotente do ponto de vista operacional;
-* permanecer disponível mesmo quando Data Quality encontrar problemas.
-
-6.7 Data Quality
-
-Responsável por:
-
-* validar contrato, completude e consistência;
-* emitir métricas e alertas;
-* gerar incidentes quando houver violação de regra;
-* nunca bloquear a disponibilidade da camada SOR.
 
 ⸻
 
@@ -232,184 +84,18 @@ Regras de validação
 * o payload deve respeitar os limites da camada de exposição da API;
 * o cliente não pode informar bucket, prefixo físico ou key final;
 * metadados obrigatórios ausentes resultam em rejeição da requisição;
-* a resposta deve ser rápida e não depender de processamento analítico.
+* a resposta deve ser rápida e não depender de processamento analítico;
+* durante a integração entre API Gateway e Lambda, o conteúdo binário será recebido pela Lambda codificado em Base64, devendo esse overhead ser considerado pelo produtor no dimensionamento do tamanho máximo de cada arquivo enviado.
 
-Respostas esperadas
+Diretriz de fragmentação
 
-* 202 Accepted ou 200 OK, conforme padrão operacional definido, quando a persistência física for concluída;
-* 400 Bad Request para contrato inválido;
-* 401/403 para autenticação ou autorização;
-* 413 Payload Too Large quando o payload exceder o limite da camada exposta;
-* 500/503 para falhas transitórias ou indisponibilidade.
+Embora o API Gateway aceite payloads de até 10 MB, a integração síncrona com a Lambda é limitada a 6 MB e ainda adiciona overhead devido à codificação Base64 do conteúdo binário. Assim, o produtor deve fragmentar o DataFrame em arquivos Parquet menores que esse limite teórico, mantendo margem suficiente para acomodar:
 
-⸻
+* o envelope multipart/form-data;
+* os metadados da requisição;
+* a expansão causada pela codificação Base64.
 
-8. Organização no S3
-
-A organização física deve ser baseada em metadados de negócio e em contexto operacional, não em detalhes técnicos do produtor.
-
-Estrutura recomendada
-
-landing/
-  dataset=<dataset>/
-    ano_mes_dia=<yyyymmdd>/
-      interaction_id=<interactionId>/
-        <sourceFileName>.parquet
-
-Princípios da estrutura
-
-* particionamento por uma única coluna concatenada de data, no formato ano_mes_dia=<yyyymmdd>;
-* isolamento por dataset;
-* rastreabilidade por interactionId;
-* objetos imutáveis;
-* sem overwrite acidental;
-* layout previsível para processamento posterior;
-* alinhamento com leitura em batch e execução por janelas.
-
-Sobre o Interaction ID
-
-O interactionId deve ser a chave preferencial de rastreio corporativo, por ser mais reconhecido e útil operacionalmente no contexto da organização.
-
-O sourceFileName pode refletir o mesmo identificador ou uma derivação dele, por exemplo:
-
-* interaction_<interactionId>_part_001.parquet
-* interaction_<interactionId>_part_002.parquet
-
-Caso o processo de origem tenha também um identificador técnico de mensagem, ele pode ser usado como complemento, mas não como referência principal do domínio.
-
-⸻
-
-9. Estratégia de processamento no Glue
-
-O Glue é executado em janelas agendadas. A frequência pode ser horária, diária ou outra adequada ao volume e à criticidade do dado.
-
-Em cada execução, o pipeline deve:
-
-1. listar os objetos elegíveis no landing;
-2. aplicar watermark operacional quando necessário;
-3. ler os Parquet disponíveis;
-4. consolidar arquivos pequenos em arquivos maiores;
-5. materializar a camada SOR;
-6. atualizar o Glue Catalog;
-7. executar Data Quality;
-8. emitir métricas e eventos de governança.
-
-Watermark operacional
-
-O uso de watermark evita capturar arquivos que ainda estejam em fase de publicação ou propagação. O objetivo não é coordenar upload, e sim proteger a execução por janela de ler um conjunto ainda instável.
-
-Consolidar small files
-
-A consolidação é responsabilidade do Glue, não da API. Isso reduz overhead de leitura, melhora o desempenho analítico e evita degradação por excesso de arquivos pequenos.
-
-Write-and-Audit
-
-A regra estrutural da plataforma é:
-
-* o dado entra;
-* o dado é materializado na SOR;
-* o Data Quality avalia depois;
-* se houver falha, gera-se incidente;
-* o dado não é retirado de consumo por padrão.
-
-Esse modelo privilegia disponibilidade, rastreabilidade e operação contínua.
-
-⸻
-
-10. Resiliência
-
-A solução é resiliente por construção, porque separa ingestão e processamento.
-
-Propriedades desejadas
-
-* a falha do Data Quality não bloqueia o consumo;
-* a indisponibilidade temporária do Glue não impede a ingestão;
-* retries do produtor são seguros;
-* a Lambda não retém estado;
-* os objetos no S3 são imutáveis;
-* o pipeline pode ser reprocessado por janela.
-
-Falhas esperadas e comportamento
-
-Falha na API ou Lambda
-
-A requisição é rejeitada e o produtor pode reprocessar o envio.
-
-Falha no upload de um arquivo
-
-O arquivo pode ser reenviado sem dependência de sessão.
-
-Falha no Glue
-
-A janela seguinte reprocessa o conjunto elegível.
-
-Falha no Data Quality
-
-A camada SOR permanece disponível e um incidente é aberto para análise.
-
-⸻
-
-11. Idempotência e reprocessamento
-
-O sistema assume consistência eventual com objetos determinísticos.
-
-Estratégia
-
-* o nome do objeto deve ser estável e previsível;
-* o particionamento físico deve permitir reprocessamento sem ambiguidade;
-* o interactionId deve ajudar a correlacionar reenvios;
-* a camada de processamento deve tolerar leituras repetidas e janelas sobrepostas.
-
-Diretriz
-
-A solução deve favorecer repetição segura em vez de mecanismos complexos de deduplicação em tempo real.
-
-⸻
-
-12. Observabilidade
-
-A observabilidade deve existir em múltiplas camadas.
-
-API Gateway
-
-* quantidade de requisições;
-* latência;
-* erros;
-* throttling;
-* payload rejeitado.
-
-Lambda
-
-* número de arquivos persistidos;
-* falhas de validação;
-* falhas de persistência em S3;
-* latência de gravação.
-
-S3 / Landing
-
-* objetos recebidos por partição;
-* crescimento de small files;
-* volume por dataset e por dia.
-
-Glue
-
-* duração por execução;
-* volume de arquivos processados;
-* volume consolidado;
-* falhas por etapa.
-
-Data Quality
-
-* regras aprovadas;
-* regras quebradas;
-* tendência de anomalias;
-* incidentes gerados.
-
-Negócio
-
-* volume por interactionId;
-* rastreabilidade por dataset e partição;
-* capacidade de correlacionar origem, ingestão e consumo.
+Essa margem operacional reduz o risco de rejeições por extrapolação de payload e torna o processo de ingestão mais previsível e resiliente.
 
 ⸻
 
@@ -422,34 +108,12 @@ Negócio
 * O produtor envia arquivos Parquet completos.
 * O cliente não controla bucket, prefixo ou key física.
 * O Glue processa em janela e não em tempo real.
-* A camada SOR é disponibilizada antes do Data Quality bloquear qualquer coisa, porque o Data Quality não bloqueia.
+* A camada SOR é disponibilizada antes da execução do Data Quality, seguindo o padrão Write-and-Audit.
 * O padrão adotado é Write-and-Audit.
 * O interactionId é o identificador corporativo preferencial.
-* A organização física no S3 usa ano_mes_dia como uma única coluna concatenada no formato yyyymmdd.
-* Small files são consolidado pelo Glue.
+* A organização física no S3 utiliza uma única coluna de particionamento denominada ano_mes_dia, contendo o valor concatenado no formato yyyymmdd.
+* O produtor deve considerar os limites combinados do API Gateway (10 MB), da invocação síncrona da Lambda (6 MB) e o overhead da codificação Base64 ao definir o tamanho máximo dos arquivos Parquet enviados.
+* Small files são consolidados pelo Glue.
 * O dado permanece disponível mesmo em caso de falha de qualidade.
 
-⸻
-
-14. Resultado esperado
-
-A solução resultante entrega:
-
-* ingestão simples e rápida;
-* acoplamento mínimo entre produtores e plataforma;
-* persistência confiável no landing;
-* arquitetura amigável a retries;
-* consolidação de small files no ponto certo da cadeia;
-* disponibilidade da camada SOR sem bloqueio;
-* data quality com postura de governança ativa, não de indisponibilização;
-* rastreabilidade por interactionId;
-* organização física por ano_mes_dia;
-* uma base evolutiva para crescer sem refatorar o contrato principal.
-
-⸻
-
-15. Conclusão
-
-Esta arquitetura trata ingestão e processamento como etapas distintas, com boundaries claros. A API e a Lambda recebem apenas o necessário para persistir arquivos Parquet válidos com baixo acoplamento; o Glue assume a responsabilidade de consolidar, catalogar e auditar os dados em janelas; e a plataforma aplica Data Quality como mecanismo de observabilidade e governança, sem comprometer a disponibilidade da camada SOR.
-
-O resultado é uma solução simples na borda, forte na operação e evolutiva na plataforma.
+Observação: Todas as demais seções da RFC permanecem inalteradas em relação à versão 5.1. Esta versão 5.2 introduz apenas o detalhamento dos limites de transporte entre API Gateway e Lambda e a diretriz de dimensionamento dos arquivos produzidos.
